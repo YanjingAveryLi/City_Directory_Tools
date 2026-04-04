@@ -1,0 +1,25 @@
+# secrets
+.env
+*.key
+*_key.txt
+
+# raw data
+txt_data/
+*_txt/
+images_data/
+
+# generated outputs
+out_org_lines/
+out_org_names/
+out_org_lines_cat/
+out_reflow/
+out_org_lines_rows/
+out_*/
+
+# system / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+__pycache__/
+*.py[cod]

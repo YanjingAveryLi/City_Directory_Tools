@@ -1,0 +1,90 @@
+headings_include:
+  - churches
+  - church
+  - clubs
+  - hospitals
+  - libraries
+  - secret societies
+  - lodges
+  - fraternal
+  - benevolent
+  - labor
+  - union
+  - veterans
+  - patriotic
+  - relief
+  - welfare
+  - young people
+  - organizations
+  - associations
+  - society
+  - societies
+  - leagues
+  - guilds
+  - posts
+  - chapters
+  - councils
+
+headings_exclude:
+  - board of trustees
+  - board of education
+  - board of health
+  - city council
+  - municipal
+  - department
+  - police
+  - fire
+  - court
+  - treasurer
+  - tax
+  - assessor
+  - recorder
+  - marshal
+  - engineer
+  - public schools
+  - city hall
+  - county
+  - state
+  - national guard
+  - post office
+
+content_signals_include:
+  - lodge
+  - chapter
+  - post
+  - order
+  - council
+  - union
+  - association
+  - league
+  - meets
+  - secretary
+  - treasurer
+  - pastor
+  - rector
+  - lodge no
+  - benevolent
+  - fraternal
+
+content_signals_exclude:
+  - board of trustees
+  - board of education
+  - board of health
+  - city council
+  - municipal
+  - department
+  - police
+  - fire
+  - court
+  - treasurer
+  - tax
+  - assessor
+  - recorder
+  - marshal
+  - engineer
+  - public schools
+  - city hall
+  - county
+  - state
+  - national guard
+  - post office
