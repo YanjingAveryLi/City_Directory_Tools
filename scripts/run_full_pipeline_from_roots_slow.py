@@ -2,9 +2,11 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import json
 import os
 import subprocess
 import time
+from datetime import UTC, datetime
 from typing import List, Tuple
 
 
@@ -79,6 +81,24 @@ def run(cmd: List[str], cwd: str) -> int:
     return subprocess.run(cmd, cwd=cwd).returncode
 
 
+def _append_progress_log(progress_log: str, payload: dict) -> None:
+    if not progress_log:
+        return
+    os.makedirs(os.path.dirname(progress_log), exist_ok=True)
+    rec = {"ts": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")}
+    rec.update(payload or {})
+    with open(progress_log, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _format_hms(seconds: float) -> str:
+    s = max(0, int(seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    return f"{h:02d}:{m:02d}:{sec:02d}"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run full pipeline from raw *_txt roots (slow, resumable).")
     ap.add_argument("--base_dir", default=".", help="Project root")
@@ -95,6 +115,8 @@ def main() -> None:
     ap.add_argument("--category_model", default="gemini-2.5-flash")
     ap.add_argument("--openai_model", default="gpt-4.1-mini")
     ap.add_argument("--openai_refine_model", default="gpt-5.4")
+    ap.add_argument("--gemini_refine_model", default="", help="Gemini second-pass refinement model for llm mode")
+    ap.add_argument("--progress_log", default="logs/pipeline_progress.jsonl", help="JSONL progress log path")
     args = ap.parse_args()
 
     base_dir = os.path.abspath(args.base_dir)
@@ -143,13 +165,34 @@ def main() -> None:
     roots_csv = ",".join(roots)
     ok = 0
     fail = 0
+    processed = 0
+    total_planned = len(planned)
+    run_t0 = time.time()
+    progress_log = os.path.join(base_dir, args.progress_log) if args.progress_log else ""
+    _append_progress_log(
+        progress_log,
+        {
+            "event": "run_start",
+            "total_planned": total_planned,
+            "base_dir": base_dir,
+            "roots": roots,
+            "org_model": args.org_model,
+            "category_model": args.category_model,
+            "gemini_refine_model": args.gemini_refine_model,
+            "openai_refine_model": args.openai_refine_model,
+        },
+    )
 
     for idx, (city_year, raw_fp, need1, need2) in enumerate(planned, start=1):
+        file_t0 = time.time()
         print(f"\n[{idx}/{len(planned)}] {city_year}")
         print(f"raw: {raw_fp}")
         org_fp = expected_org_lines_txt(base_dir, raw_fp, roots)
+        stage1_sec = 0.0
+        stage2_sec = 0.0
 
         if need1:
+            s1_t0 = time.time()
             cmd1 = [
                 "python",
                 "scripts/org_lines_gemini.py",
@@ -164,13 +207,46 @@ def main() -> None:
                 "--skip_existing",
             ]
             rc1 = run(cmd1, base_dir)
+            stage1_sec = time.time() - s1_t0
             if rc1 != 0:
                 print(f"  !! stage1 failed rc={rc1}")
                 fail += 1
+                processed += 1
+                elapsed = time.time() - run_t0
+                speed = (processed / elapsed) if elapsed > 0 else 0.0
+                remain = max(0, total_planned - processed)
+                eta_sec = (remain / speed) if speed > 0 else -1.0
+                print(
+                    f"  progress ok={ok} fail={fail} processed={processed}/{total_planned} "
+                    f"avg={elapsed / max(1, processed):.2f}s/file eta={_format_hms(eta_sec) if eta_sec >= 0 else '--:--:--'}"
+                )
+                _append_progress_log(
+                    progress_log,
+                    {
+                        "event": "file_done",
+                        "idx": idx,
+                        "total_planned": total_planned,
+                        "city_year": city_year,
+                        "raw_fp": raw_fp,
+                        "need_stage1": need1,
+                        "need_stage2": need2,
+                        "stage1_sec": round(stage1_sec, 3),
+                        "stage2_sec": round(stage2_sec, 3),
+                        "file_sec": round(time.time() - file_t0, 3),
+                        "status": "fail_stage1",
+                        "ok": ok,
+                        "fail": fail,
+                        "processed": processed,
+                        "elapsed_sec": round(elapsed, 3),
+                        "avg_sec_per_file": round(elapsed / max(1, processed), 3),
+                        "eta_sec": round(eta_sec, 3) if eta_sec >= 0 else -1,
+                    },
+                )
                 time.sleep(args.sleep_between)
                 continue
 
         if need2:
+            s2_t0 = time.time()
             cmd2 = [
                 "python",
                 "scripts/extract_org_names_from_reflow.py",
@@ -187,28 +263,121 @@ def main() -> None:
                 "llm",
                 "--model",
                 args.category_model,
-                "--llm_refine_with_openai",
-                "--llm_refine_target",
-                "uncategorized",
-                "--openai_refine_model",
-                args.openai_refine_model,
-                "--openai_page_chunk_size",
-                "160",
-                "--openai_sleep_seconds",
-                "0.8",
                 "--skip_existing",
             ]
+            if (args.gemini_refine_model or "").strip():
+                cmd2.extend(
+                    [
+                        "--llm_refine_with_gemini",
+                        "--gemini_refine_model",
+                        args.gemini_refine_model,
+                        "--gemini_refine_target",
+                        "uncategorized",
+                        "--gemini_refine_sleep_seconds",
+                        "0.2",
+                    ]
+                )
+            else:
+                cmd2.extend(
+                    [
+                        "--llm_refine_with_openai",
+                        "--llm_refine_target",
+                        "uncategorized",
+                        "--openai_refine_model",
+                        args.openai_refine_model,
+                        "--openai_page_chunk_size",
+                        "160",
+                        "--openai_sleep_seconds",
+                        "0.8",
+                    ]
+                )
             rc2 = run(cmd2, base_dir)
+            stage2_sec = time.time() - s2_t0
             if rc2 != 0:
                 print(f"  !! stage2 failed rc={rc2}")
                 fail += 1
+                processed += 1
+                elapsed = time.time() - run_t0
+                speed = (processed / elapsed) if elapsed > 0 else 0.0
+                remain = max(0, total_planned - processed)
+                eta_sec = (remain / speed) if speed > 0 else -1.0
+                print(
+                    f"  progress ok={ok} fail={fail} processed={processed}/{total_planned} "
+                    f"avg={elapsed / max(1, processed):.2f}s/file eta={_format_hms(eta_sec) if eta_sec >= 0 else '--:--:--'}"
+                )
+                _append_progress_log(
+                    progress_log,
+                    {
+                        "event": "file_done",
+                        "idx": idx,
+                        "total_planned": total_planned,
+                        "city_year": city_year,
+                        "raw_fp": raw_fp,
+                        "need_stage1": need1,
+                        "need_stage2": need2,
+                        "stage1_sec": round(stage1_sec, 3),
+                        "stage2_sec": round(stage2_sec, 3),
+                        "file_sec": round(time.time() - file_t0, 3),
+                        "status": "fail_stage2",
+                        "ok": ok,
+                        "fail": fail,
+                        "processed": processed,
+                        "elapsed_sec": round(elapsed, 3),
+                        "avg_sec_per_file": round(elapsed / max(1, processed), 3),
+                        "eta_sec": round(eta_sec, 3) if eta_sec >= 0 else -1,
+                    },
+                )
                 time.sleep(args.sleep_between)
                 continue
 
         ok += 1
+        processed += 1
+        elapsed = time.time() - run_t0
+        speed = (processed / elapsed) if elapsed > 0 else 0.0
+        remain = max(0, total_planned - processed)
+        eta_sec = (remain / speed) if speed > 0 else -1.0
+        file_sec = time.time() - file_t0
+        print(
+            f"  timing stage1={stage1_sec:.2f}s stage2={stage2_sec:.2f}s file={file_sec:.2f}s | "
+            f"ok={ok} fail={fail} processed={processed}/{total_planned} "
+            f"avg={elapsed / max(1, processed):.2f}s/file eta={_format_hms(eta_sec) if eta_sec >= 0 else '--:--:--'}"
+        )
+        _append_progress_log(
+            progress_log,
+            {
+                "event": "file_done",
+                "idx": idx,
+                "total_planned": total_planned,
+                "city_year": city_year,
+                "raw_fp": raw_fp,
+                "need_stage1": need1,
+                "need_stage2": need2,
+                "stage1_sec": round(stage1_sec, 3),
+                "stage2_sec": round(stage2_sec, 3),
+                "file_sec": round(file_sec, 3),
+                "status": "ok",
+                "ok": ok,
+                "fail": fail,
+                "processed": processed,
+                "elapsed_sec": round(elapsed, 3),
+                "avg_sec_per_file": round(elapsed / max(1, processed), 3),
+                "eta_sec": round(eta_sec, 3) if eta_sec >= 0 else -1,
+            },
+        )
         time.sleep(args.sleep_between)
 
     print(f"\ndone ok={ok} fail={fail}")
+    _append_progress_log(
+        progress_log,
+        {
+            "event": "run_end",
+            "ok": ok,
+            "fail": fail,
+            "processed": processed,
+            "total_planned": total_planned,
+            "elapsed_sec": round(time.time() - run_t0, 3),
+        },
+    )
     if fail > 0:
         raise SystemExit(1)
 

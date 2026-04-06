@@ -366,6 +366,50 @@ Organization name:
 """.strip()
 
 
+def _build_refine_category_prompt(
+    org_name: str,
+    line_text: str,
+    prev_line: str = "",
+    next_line: str = "",
+    current_category: str = "",
+) -> str:
+    """LLM refinement prompt with local line context."""
+    cat_lines = "\n".join(get_llm_category_descriptions())
+    return f"""
+You are performing second-pass category refinement for one historical city-directory row.
+Use organization name plus nearby lines as context.
+Return STRICT JSON only: {{ "organization_category": "..." }}.
+Use only the category name (no parenthetical descriptions).
+
+Current predicted category:
+{current_category or "Uncategorized"}
+
+Organization name:
+{org_name}
+
+Previous line:
+{prev_line or "(none)"}
+
+Current line:
+{line_text}
+
+Next line:
+{next_line or "(none)"}
+
+These are NOT social organizations — always return "Uncategorized":
+- Insurance companies / underwriters / indemnity associations
+- Mutual insurance entities
+- Building & Loan entities
+- Government/public agencies and schools
+- General businesses that are not social organizations
+
+Valid categories (choose exactly one):
+{cat_lines}
+
+If uncertain, return "Uncategorized".
+""".strip()
+
+
 def _normalize_category(cat: str) -> str:
     """Strip trailing parenthetical (e.g. 'Churches (Religious institutions)' -> 'Churches')."""
     if not cat:
@@ -799,6 +843,83 @@ def _refine_rows_with_openai(
     return _fix_sandwich(out)
 
 
+def _refine_rows_with_gemini(
+    rows: List[Dict[str, str]],
+    model: Optional[genai.GenerativeModel],
+    target: str = "uncategorized",
+    sleep_seconds: float = 0.0,
+) -> List[Dict[str, str]]:
+    """
+    Optional second-pass refinement using Gemini model.
+    Currently targets Uncategorized rows by default.
+    """
+    if model is None:
+        return rows
+
+    target = (target or "uncategorized").strip().lower()
+    out = [dict(r) for r in rows]
+    cache: Dict[str, str] = {}
+    refine_indexes: List[int] = []
+    for i, r in enumerate(out):
+        old_cat = (r.get("organization_category") or "").strip()
+        if target == "uncategorized" and old_cat != "Uncategorized":
+            continue
+        if (r.get("social_organization") or "").strip():
+            refine_indexes.append(i)
+
+    total_refine = len(refine_indexes)
+    if total_refine == 0:
+        return _fix_sandwich(out)
+    print(f"Gemini refine start: target_rows={total_refine}", flush=True)
+    refine_t0 = time.time()
+
+    for n, i in enumerate(refine_indexes, start=1):
+        r = out[i]
+        old_cat = (r.get("organization_category") or "").strip()
+        if target == "uncategorized" and old_cat != "Uncategorized":
+            continue
+
+        org = (r.get("social_organization") or "").strip()
+        line = (r.get("line") or "").strip()
+        if not org:
+            continue
+
+        prev_line = (out[i - 1].get("line") or "").strip() if i - 1 >= 0 else ""
+        next_line = (out[i + 1].get("line") or "").strip() if i + 1 < len(out) else ""
+        cache_key = "\n".join([org, line, prev_line, next_line, old_cat])
+        if cache_key in cache:
+            new_cat = cache[cache_key]
+        else:
+            prompt = _build_refine_category_prompt(
+                org_name=org,
+                line_text=line,
+                prev_line=prev_line,
+                next_line=next_line,
+                current_category=old_cat,
+            )
+            data = _call_model(model, prompt, 0.0) or {}
+            new_cat = _normalize_category((data.get("organization_category") or "").strip())
+            new_cat = normalize_to_allowed_category(new_cat or "Uncategorized")
+            cache[cache_key] = new_cat
+
+        if new_cat:
+            out[i]["organization_category"] = new_cat
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+        if n % 20 == 0 or n == total_refine:
+            elapsed = time.time() - refine_t0
+            avg = elapsed / max(1, n)
+            remain = total_refine - n
+            eta = int(remain * avg)
+            print(
+                f"Gemini refine progress: {n}/{total_refine} "
+                f"avg={avg:.2f}s/row eta={eta}s",
+                flush=True,
+            )
+
+    return _fix_sandwich(out)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Extract organization names from reflow/org_lines txt (Gemini)")
     ap.add_argument("--input", default="", help="Single input file path")
@@ -830,6 +951,10 @@ def main() -> None:
     ap.add_argument("--openai_sleep_seconds", type=float, default=0.0, help="Sleep between OpenAI page-batch calls")
     ap.add_argument("--llm_refine_with_openai", action="store_true", help="For category_mode=llm/llm_vision, run OpenAI second-pass refinement")
     ap.add_argument("--llm_refine_target", default="uncategorized", help="Refine target for llm modes: uncategorized")
+    ap.add_argument("--llm_refine_with_gemini", action="store_true", help="For category_mode=llm/llm_vision, run Gemini second-pass refinement")
+    ap.add_argument("--gemini_refine_model", default="", help="Gemini model for second-pass refinement (e.g. gemini-3.1-pro-preview)")
+    ap.add_argument("--gemini_refine_target", default="uncategorized", help="Refine target for Gemini second pass")
+    ap.add_argument("--gemini_refine_sleep_seconds", type=float, default=0.0, help="Sleep between Gemini refinement calls")
     ap.add_argument("--temperature", type=float, default=0.2, help="Temperature")
     args = ap.parse_args()
 
@@ -850,6 +975,12 @@ def main() -> None:
         openai_client = OpenAI(api_key=openai_key)
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(args.model)
+    gemini_refine_model = None
+    if args.llm_refine_with_gemini:
+        gm = (args.gemini_refine_model or "").strip()
+        if not gm:
+            raise SystemExit("Gemini refinement requires --gemini_refine_model")
+        gemini_refine_model = genai.GenerativeModel(gm)
 
     targets: List[str] = []
     if args.input:
@@ -912,6 +1043,13 @@ def main() -> None:
                         target=args.llm_refine_target,
                         page_chunk_size=args.openai_page_chunk_size,
                         sleep_seconds=args.openai_sleep_seconds,
+                    )
+                if args.llm_refine_with_gemini:
+                    rows = _refine_rows_with_gemini(
+                        rows=rows,
+                        model=gemini_refine_model,
+                        target=args.gemini_refine_target,
+                        sleep_seconds=args.gemini_refine_sleep_seconds,
                     )
             if out_path.endswith(".json"):
                 with open(out_path, "w", encoding="utf-8") as f:
@@ -1020,6 +1158,13 @@ def main() -> None:
                         target=args.llm_refine_target,
                         page_chunk_size=args.openai_page_chunk_size,
                         sleep_seconds=args.openai_sleep_seconds,
+                    )
+                if args.llm_refine_with_gemini:
+                    rows = _refine_rows_with_gemini(
+                        rows=rows,
+                        model=gemini_refine_model,
+                        target=args.gemini_refine_target,
+                        sleep_seconds=args.gemini_refine_sleep_seconds,
                     )
             out_csv = os.path.join(args.lines_output_dir_cat, rel + args.lines_suffix)
             os.makedirs(os.path.dirname(out_csv), exist_ok=True)

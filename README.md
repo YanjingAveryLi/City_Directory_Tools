@@ -29,6 +29,8 @@ python scripts/gemini_image_to_txt.py \
 
 **Batch run (explicit roots)**
 ```
+cd "/Users/1532016078qq.com/Desktop/zlt-City Diectory/city-directory-tools"
+set -a && source .env && set +a
 python scripts/run_full_pipeline_in_batches.py \
   --base_dir "." \
   --roots "txt_data/al_txt,txt_data/ar_txt,txt_data/ca_txt,txt_data/ia_txt,txt_data/ks_txt,txt_data/ky_txt,txt_data/la_txt,txt_data/ma_txt,txt_data/mi_txt,txt_data/mn_txt,txt_data/mo_txt" \
@@ -39,3 +41,17 @@ python scripts/run_full_pipeline_in_batches.py \
   --category_model "gemini-2.5-flash" \
   --openai_refine_model "gpt-5.4"
 ```
+
+**All Gemini version**
+
+```
+python scripts/run_full_pipeline_in_batches.py \
+  --base_dir "." \
+  --roots "txt_data/al_txt,txt_data/ar_txt,txt_data/ca_txt,txt_data/ia_txt,txt_data/ks_txt,txt_data/ky_txt,txt_data/la_txt,txt_data/ma_txt,txt_data/mi_txt,txt_data/mn_txt,txt_data/mo_txt" \
+  --batch_size 120 \
+  --sleep_between_files 1.0 \
+  --sleep_between_batches 300 \
+  --continue_on_error \
+  --category_model "gemini-3-flash-preview" \
+  --gemini_refine_model "gemini-3.1-pro-preview"
+  ```

@@ -48,6 +48,7 @@ def main() -> None:
     ap.add_argument("--category_model", default="gemini-2.5-flash")
     ap.add_argument("--openai_model", default="gpt-4.1-mini")
     ap.add_argument("--openai_refine_model", default="gpt-5.4")
+    ap.add_argument("--gemini_refine_model", default="", help="Gemini second-pass refinement model for llm mode")
     args = ap.parse_args()
 
     base_dir = os.path.abspath(args.base_dir)
@@ -77,6 +78,8 @@ def main() -> None:
             args.openai_model,
             "--openai_refine_model",
             args.openai_refine_model,
+            "--gemini_refine_model",
+            args.gemini_refine_model,
             "--dry_run",
         ]
         if args.roots.strip():
@@ -114,6 +117,8 @@ def main() -> None:
             args.openai_model,
             "--openai_refine_model",
             args.openai_refine_model,
+            "--gemini_refine_model",
+            args.gemini_refine_model,
         ]
         if args.roots.strip():
             run_cmd.extend(["--roots", args.roots])
