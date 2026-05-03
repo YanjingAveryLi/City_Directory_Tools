@@ -6,7 +6,7 @@ This repository implements a city directory processing pipeline for extracting o
 
 **stage 1: OCR**
 ```
-python scripts/gemini_image_to_txt.py \
+python scripts/stage0_ocr/gemini_image_to_txt.py \
   --input_roots "images_data" \
   --output_dir "txt_data" \
   --skip_existing
@@ -14,9 +14,9 @@ python scripts/gemini_image_to_txt.py \
 
 **stage 2: Extract & Classify**
 ```
-cd "/Users/1532016078qq.com/Desktop/zlt-City Diectory/city-directory-tools"
+cd /path/to/city-directory-tools
 set -a && source .env && set +a
-python scripts/run_full_pipeline_in_batches.py \
+python scripts/pipeline/run_full_pipeline_in_batches.py \
   --base_dir "." \
   --roots "txt_data/al_txt,txt_data/ar_txt,txt_data/ca_txt,txt_data/ia_txt,txt_data/ks_txt,txt_data/ky_txt,txt_data/la_txt,txt_data/ma_txt,txt_data/mi_txt,txt_data/mn_txt,txt_data/mo_txt" \
   --batch_size 120 \
@@ -30,7 +30,7 @@ python scripts/run_full_pipeline_in_batches.py \
 **All Gemini version**
 
 ```
-python scripts/run_full_pipeline_in_batches.py \
+python scripts/pipeline/run_full_pipeline_in_batches.py \
   --base_dir "." \
   --roots "txt_data/al_txt,txt_data/ar_txt,txt_data/ca_txt,txt_data/ia_txt,txt_data/ks_txt,txt_data/ky_txt,txt_data/la_txt,txt_data/ma_txt,txt_data/mi_txt,txt_data/mn_txt,txt_data/mo_txt" \
   --batch_size 120 \
@@ -44,9 +44,9 @@ python scripts/run_full_pipeline_in_batches.py \
 **All GPT / OpenAI version**
 
 ```
-cd "/Users/1532016078qq.com/Desktop/zlt-City Diectory/city-directory-tools"
+cd /path/to/city-directory-tools
 set -a && source .env && set +a
-python scripts/run_full_pipeline_in_batches_openai.py \
+python scripts/pipeline/run_full_pipeline_in_batches_openai.py \
   --base_dir "." \
   --roots "txt_data/al_txt,txt_data/ar_txt,txt_data/ca_txt,txt_data/ia_txt,txt_data/ks_txt,txt_data/ky_txt,txt_data/la_txt,txt_data/ma_txt,txt_data/mi_txt,txt_data/mn_txt,txt_data/mo_txt" \
   --batch_size 120 \
@@ -61,7 +61,7 @@ python scripts/run_full_pipeline_in_batches_openai.py \
 
 **stage 3: Merge**
 ```
-python3 scripts/merge_city_to_single_csv.py \
+python3 scripts/utils/merge_city_to_single_csv.py \
   --root output/org_lines_cat \
   --outdir output/city_merged
 ```

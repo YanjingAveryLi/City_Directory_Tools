@@ -45,7 +45,7 @@ def main() -> None:
     args = ap.parse_args()
 
     base_dir = os.path.abspath(args.base_dir)
-    runner = os.path.join("scripts", "run_full_pipeline_from_roots_openai.py")
+    runner = os.path.join("scripts", "stage2_extract_classify", "run_full_pipeline_from_roots_openai.py")
 
     batch_idx = 0
     while True:

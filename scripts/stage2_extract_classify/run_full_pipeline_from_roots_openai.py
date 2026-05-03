@@ -40,8 +40,6 @@ def infer_rel_from_roots(base_dir: str, file_path: str, roots: List[str]) -> str
         except Exception:
             continue
         if rel and not rel.startswith(".."):
-            # Keep state-level root folder in output path, e.g.
-            # data/txt/ca_txt/... -> ca_txt/...
             root_name = os.path.basename(r_abs.rstrip(os.sep))
             rel_norm = rel.replace("\\", "/")
             return f"{root_name}/{rel_norm}" if root_name else rel_norm
@@ -104,22 +102,17 @@ def _format_hms(seconds: float) -> str:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Run full pipeline from raw *_txt roots (slow, resumable).")
+    ap = argparse.ArgumentParser(description="Run full pipeline from raw *_txt roots using OpenAI only.")
     ap.add_argument("--base_dir", default=".", help="Project root")
-    ap.add_argument(
-        "--roots",
-        default="",
-        help="Comma-separated absolute/relative roots. Empty means auto-detect data/txt/*_txt first, then base_dir/*_txt.",
-    )
+    ap.add_argument("--roots", default="", help="Comma-separated roots. Empty means auto-detect data/txt/*_txt.")
     ap.add_argument("--max_new", type=int, default=120, help="Max files to process in this run")
     ap.add_argument("--sleep_between", type=float, default=1.0, help="Seconds between files")
     ap.add_argument("--skip_city_prefix", default="", help="Skip city-year prefix (e.g. Birmingham)")
     ap.add_argument("--dry_run", action="store_true", help="Print plan only")
-    ap.add_argument("--org_model", default="gemini-2.0-flash")
-    ap.add_argument("--category_model", default="gemini-2.5-flash")
-    ap.add_argument("--openai_model", default="gpt-4.1-nano")
-    ap.add_argument("--openai_refine_model", default="gpt-5.4")
-    ap.add_argument("--gemini_refine_model", default="", help="Gemini second-pass refinement model for llm mode")
+    ap.add_argument("--org_model", default="gpt-4.1-nano", help="OpenAI model for stage1 org-line normalization")
+    ap.add_argument("--name_extraction_model", default="gpt-4.1-nano", help="OpenAI model for org-name extraction")
+    ap.add_argument("--category_model", default="gpt-4.1-nano", help="OpenAI model for category classification")
+    ap.add_argument("--category_refine_model", default="gpt-5.4", help="OpenAI model for second-pass refinement")
     ap.add_argument("--progress_log", default="logs/pipeline_progress.jsonl", help="JSONL progress log path")
     args = ap.parse_args()
 
@@ -181,9 +174,10 @@ def main() -> None:
             "base_dir": base_dir,
             "roots": roots,
             "org_model": args.org_model,
+            "name_extraction_model": args.name_extraction_model,
             "category_model": args.category_model,
-            "gemini_refine_model": args.gemini_refine_model,
-            "openai_refine_model": args.openai_refine_model,
+            "openai_refine_model": args.category_refine_model,
+            "pipeline_family": "openai",
         },
     )
 
@@ -199,7 +193,7 @@ def main() -> None:
             s1_t0 = time.time()
             cmd1 = [
                 "python",
-                "scripts/org_lines_gemini.py",
+                "scripts/stage2_extract_classify/org_lines_openai.py",
                 "--input",
                 raw_fp,
                 "--input_roots",
@@ -253,7 +247,7 @@ def main() -> None:
             s2_t0 = time.time()
             cmd2 = [
                 "python",
-                "scripts/extract_org_names_from_reflow.py",
+                "scripts/stage2_extract_classify/extract_org_names_from_reflow.py",
                 "--input",
                 org_fp,
                 "--input_dir",
@@ -263,38 +257,22 @@ def main() -> None:
                 "output/org_lines_cat",
                 "--output_dir",
                 "output/org_names",
+                "--name_extraction_provider",
+                "openai",
+                "--name_extraction_model",
+                args.name_extraction_model,
                 "--category_mode",
-                "llm",
-                "--model",
+                "openai",
+                "--openai_model",
                 args.category_model,
+                "--openai_refine_model",
+                args.category_refine_model,
+                "--openai_page_chunk_size",
+                "160",
+                "--openai_sleep_seconds",
+                "0.8",
                 "--skip_existing",
             ]
-            if (args.gemini_refine_model or "").strip():
-                cmd2.extend(
-                    [
-                        "--llm_refine_with_gemini",
-                        "--gemini_refine_model",
-                        args.gemini_refine_model,
-                        "--gemini_refine_target",
-                        "uncategorized",
-                        "--gemini_refine_sleep_seconds",
-                        "0.2",
-                    ]
-                )
-            else:
-                cmd2.extend(
-                    [
-                        "--llm_refine_with_openai",
-                        "--llm_refine_target",
-                        "uncategorized",
-                        "--openai_refine_model",
-                        args.openai_refine_model,
-                        "--openai_page_chunk_size",
-                        "160",
-                        "--openai_sleep_seconds",
-                        "0.8",
-                    ]
-                )
             rc2 = run(cmd2, base_dir)
             stage2_sec = time.time() - s2_t0
             if rc2 != 0:

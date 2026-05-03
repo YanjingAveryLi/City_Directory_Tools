@@ -5,12 +5,29 @@ Use Gemini to OCR images into plain text files.
 """
 
 import argparse
+import json
 import os
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import List
 
 import google.generativeai as genai
 from PIL import Image
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _ts() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def _log(log_path: str, record: dict) -> None:
+    if not log_path:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp")
@@ -46,15 +63,20 @@ _OCR_PROMPTS = [
         "You are OCR for historical city directory page images.\n"
         "Return plain UTF-8 text only.\n"
         "Preserve line breaks as much as possible.\n"
-        "Do not add explanations, markdown, or code fences."
+        "Do not add explanations, markdown, or code fences.\n"
+        "IMPORTANT: These are book scans. Focus only on the PRIMARY page content "
+        "(the large, clearly readable text area). "
+        "Ignore any narrow strips of text from an adjacent page visible at the edges."
     ),
     (
-        "Transcribe every word visible in this image exactly as printed.\n"
-        "Include all columns, headings, and advertisements.\n"
+        "Transcribe every word on the MAIN PAGE of this historical city directory scan.\n"
+        "The image may show a thin strip of an adjacent page at the edge — ignore it entirely.\n"
+        "Include all columns, headings, and advertisements on the main page.\n"
         "Return raw text only, preserving line breaks. No explanations."
     ),
     (
         "Read and output all text in this scanned page image.\n"
+        "Focus on the dominant/central text content; discard any partial text bleeding in from page edges.\n"
         "Return plain text only."
     ),
 ]
@@ -126,6 +148,8 @@ def main() -> None:
     ap.add_argument("--num_votes", type=int, default=1, help="OCR 投票次数（>1时多次调用后合并）")
     ap.add_argument("--retry", type=int, default=2, help="Retry times on failure")
     ap.add_argument("--sleep_seconds", type=float, default=1.0, help="Sleep between retries")
+    ap.add_argument("--log_file", default=str(PROJECT_ROOT / "logs/ocr_progress.jsonl"),
+                    help="Append-only JSONL progress log (empty string to disable)")
     args = ap.parse_args()
 
     api_key = args.api_key or os.getenv("GOOGLE_API_KEY")
@@ -150,9 +174,23 @@ def main() -> None:
         targets = targets[: args.max_files]
 
     os.makedirs(args.output_dir, exist_ok=True)
+    log_file = args.log_file
+
+    run_start = time.time()
+    _log(log_file, {
+        "ts": _ts(),
+        "event": "ocr_run_start",
+        "total_planned": len(targets),
+        "input_roots": roots,
+        "output_dir": args.output_dir,
+        "model": args.model,
+        "num_votes": max(1, args.num_votes),
+        "skip_existing": args.skip_existing,
+    })
 
     ok = 0
     fail = 0
+    skipped = 0
     for i, fp in enumerate(targets, start=1):
         rel = infer_rel(fp, roots)
         rel_no_ext, _ = os.path.splitext(rel)
@@ -161,8 +199,10 @@ def main() -> None:
 
         if args.skip_existing and os.path.isfile(out_txt):
             print(f"[{i}/{len(targets)}] skip existing: {out_txt}")
+            skipped += 1
             continue
 
+        t0 = time.time()
         try:
             num_votes = max(1, args.num_votes)
             if num_votes == 1:
@@ -179,10 +219,48 @@ def main() -> None:
                 f.write(text + ("\n" if text else ""))
             print(f"[{i}/{len(targets)}] ok: {fp} -> {out_txt}")
             ok += 1
+            _log(log_file, {
+                "ts": _ts(),
+                "event": "ocr_file_done",
+                "idx": i,
+                "total_planned": len(targets),
+                "input_fp": fp,
+                "output_fp": out_txt,
+                "chars": len(text),
+                "elapsed_sec": round(time.time() - t0, 2),
+                "status": "ok",
+                "ok": ok,
+                "fail": fail,
+                "skipped": skipped,
+            })
         except Exception as e:
             print(f"[{i}/{len(targets)}] fail: {fp} ({e})")
             fail += 1
+            _log(log_file, {
+                "ts": _ts(),
+                "event": "ocr_file_done",
+                "idx": i,
+                "total_planned": len(targets),
+                "input_fp": fp,
+                "output_fp": out_txt,
+                "chars": 0,
+                "elapsed_sec": round(time.time() - t0, 2),
+                "status": "fail",
+                "error": str(e),
+                "ok": ok,
+                "fail": fail,
+                "skipped": skipped,
+            })
 
+    _log(log_file, {
+        "ts": _ts(),
+        "event": "ocr_run_end",
+        "total_planned": len(targets),
+        "ok": ok,
+        "fail": fail,
+        "skipped": skipped,
+        "elapsed_sec": round(time.time() - run_start, 2),
+    })
     print(f"done ok={ok} fail={fail}")
     if fail > 0:
         raise SystemExit(1)
