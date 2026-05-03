@@ -4,6 +4,7 @@
 *_key.txt
 
 # raw data
+data/raw/
 txt_data/
 *_txt/
 images_data/

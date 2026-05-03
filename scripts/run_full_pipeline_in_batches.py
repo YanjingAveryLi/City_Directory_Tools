@@ -46,7 +46,7 @@ def main() -> None:
     ap.add_argument("--continue_on_error", action="store_true", help="Continue next batch even if current batch has failures")
     ap.add_argument("--org_model", default="gemini-2.0-flash")
     ap.add_argument("--category_model", default="gemini-2.5-flash")
-    ap.add_argument("--openai_model", default="gpt-4.1-mini")
+    ap.add_argument("--openai_model", default="gpt-4.1-nano")
     ap.add_argument("--openai_refine_model", default="gpt-5.4")
     ap.add_argument("--gemini_refine_model", default="", help="Gemini second-pass refinement model for llm mode")
     args = ap.parse_args()

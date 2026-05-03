@@ -6,8 +6,12 @@ import json
 import os
 import subprocess
 import time
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import List, Tuple
+from zoneinfo import ZoneInfo
+
+
+CHICAGO_TZ = ZoneInfo("America/Chicago")
 
 
 def iter_txt_files(root: str) -> List[str]:
@@ -37,7 +41,7 @@ def infer_rel_from_roots(base_dir: str, file_path: str, roots: List[str]) -> str
             continue
         if rel and not rel.startswith(".."):
             # Keep state-level root folder in output path, e.g.
-            # txt_data/ca_txt/... -> ca_txt/...
+            # data/txt/ca_txt/... -> ca_txt/...
             root_name = os.path.basename(r_abs.rstrip(os.sep))
             rel_norm = rel.replace("\\", "/")
             return f"{root_name}/{rel_norm}" if root_name else rel_norm
@@ -53,12 +57,12 @@ def strip_txt_suffix(path_rel: str) -> str:
 
 def expected_org_lines_txt(base_dir: str, raw_fp: str, roots: List[str]) -> str:
     rel = infer_rel_from_roots(base_dir, raw_fp, roots)
-    return os.path.join(base_dir, "out_org_lines", rel + ".org_lines.txt")
+    return os.path.join(base_dir, "output/org_lines", rel + ".org_lines.txt")
 
 
 def expected_cat_csv(base_dir: str, raw_fp: str, roots: List[str]) -> str:
     rel = strip_txt_suffix(infer_rel_from_roots(base_dir, raw_fp, roots))
-    return os.path.join(base_dir, "out_org_lines_cat", rel + ".cat.csv")
+    return os.path.join(base_dir, "output/org_lines_cat", rel + ".cat.csv")
 
 
 def collect_targets(base_dir: str, roots: List[str], skip_prefix: str) -> List[Tuple[str, str]]:
@@ -85,7 +89,7 @@ def _append_progress_log(progress_log: str, payload: dict) -> None:
     if not progress_log:
         return
     os.makedirs(os.path.dirname(progress_log), exist_ok=True)
-    rec = {"ts": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")}
+    rec = {"ts": datetime.now(CHICAGO_TZ).isoformat(timespec="seconds")}
     rec.update(payload or {})
     with open(progress_log, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -105,7 +109,7 @@ def main() -> None:
     ap.add_argument(
         "--roots",
         default="",
-        help="Comma-separated absolute/relative roots. Empty means auto-detect txt_data/*_txt first, then base_dir/*_txt.",
+        help="Comma-separated absolute/relative roots. Empty means auto-detect data/txt/*_txt first, then base_dir/*_txt.",
     )
     ap.add_argument("--max_new", type=int, default=120, help="Max files to process in this run")
     ap.add_argument("--sleep_between", type=float, default=1.0, help="Seconds between files")
@@ -113,7 +117,7 @@ def main() -> None:
     ap.add_argument("--dry_run", action="store_true", help="Print plan only")
     ap.add_argument("--org_model", default="gemini-2.0-flash")
     ap.add_argument("--category_model", default="gemini-2.5-flash")
-    ap.add_argument("--openai_model", default="gpt-4.1-mini")
+    ap.add_argument("--openai_model", default="gpt-4.1-nano")
     ap.add_argument("--openai_refine_model", default="gpt-5.4")
     ap.add_argument("--gemini_refine_model", default="", help="Gemini second-pass refinement model for llm mode")
     ap.add_argument("--progress_log", default="logs/pipeline_progress.jsonl", help="JSONL progress log path")
@@ -124,7 +128,7 @@ def main() -> None:
         roots = [os.path.abspath(r.strip()) for r in args.roots.split(",") if r.strip()]
     else:
         roots = []
-        txt_data_root = os.path.join(base_dir, "txt_data")
+        txt_data_root = os.path.join(base_dir, "data/txt")
         if os.path.isdir(txt_data_root):
             for name in sorted(os.listdir(txt_data_root)):
                 p = os.path.join(txt_data_root, name)
@@ -201,7 +205,7 @@ def main() -> None:
                 "--input_roots",
                 roots_csv,
                 "--output_dir",
-                "out_org_lines",
+                "output/org_lines",
                 "--model",
                 args.org_model,
                 "--skip_existing",
@@ -253,12 +257,12 @@ def main() -> None:
                 "--input",
                 org_fp,
                 "--input_dir",
-                "out_org_lines",
+                "output/org_lines",
                 "--emit_lines",
                 "--lines_output_dir_cat",
-                "out_org_lines_cat",
+                "output/org_lines_cat",
                 "--output_dir",
-                "out_org_names",
+                "output/org_names",
                 "--category_mode",
                 "llm",
                 "--model",

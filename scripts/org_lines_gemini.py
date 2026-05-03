@@ -95,7 +95,7 @@ def _infer_output_rel(fp: str, roots: List[str]) -> str:
             continue
         if rel and not rel.startswith(".."):
             # Keep the state-level root folder name in output hierarchy, e.g.
-            # txt_data/ca_txt/... -> ca_txt/...
+            # data/txt/ca_txt/... -> ca_txt/...
             root_name = os.path.basename(r_abs.rstrip(os.sep))
             rel_norm = rel.replace("\\", "/")
             return f"{root_name}/{rel_norm}" if root_name else rel_norm
@@ -106,7 +106,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Gemini 输出一行一个组织")
     ap.add_argument("--input", default="", help="单文件路径 .txt")
     ap.add_argument("--input_roots", default="", help="逗号分隔 roots")
-    ap.add_argument("--output_dir", default="out_org_lines", help="输出目录")
+    ap.add_argument("--output_dir", default="output/org_lines", help="输出目录")
     ap.add_argument("--model", default="gemini-2.0-flash", help="Gemini 模型名")
     ap.add_argument("--api_key", default="", help="API key（或环境变量 GOOGLE_API_KEY）")
     ap.add_argument("--temperature", type=float, default=0.2, help="温度")

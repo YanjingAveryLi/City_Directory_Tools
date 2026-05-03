@@ -2,14 +2,6 @@
 
 This repository implements a city directory processing pipeline for extracting organization-related lines and structured category outputs from historical OCR text. The pipeline starts from raw images, normalizes page content into one-organization-per-line intermediates, then classifies and exports final artifacts for downstream analysis. 
 
-### What it does
-1. Read raw files under `txt_data/*_txt` roots (auto-detected), or custom roots via `--roots`.
-2. Stage1: generate `out_org_lines/.../*.org_lines.txt`.
-3. Stage2: generate:
-   - `out_org_names/.../*.org_names.json`
-   - `out_org_lines_cat/.../*.cat.csv`
-   - `out_org_lines_cat/.../*.cat.reasons.csv`
-
 ### Run 
 
 **stage 1: OCR**

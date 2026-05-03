@@ -156,6 +156,36 @@ OPENAI_PAGE_SCHEMA = {
     },
 }
 
+OPENAI_ORG_NAMES_SCHEMA = {
+    "name": "organization_names",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "org_names": {
+                "type": "array",
+                "items": {"type": "string"},
+            }
+        },
+        "required": ["org_names"],
+        "additionalProperties": False,
+    },
+}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
 
 def _iter_txt_files_by_ext(root: str, ext: str) -> List[str]:
     files: List[str] = []
@@ -198,6 +228,38 @@ Text:
 """.strip()
 
 
+def _build_openai_name_extraction_prompt() -> str:
+    return """
+You extract ONLY organization names from a city directory reflow text.
+Do NOT output any fields other than org_names.
+Do NOT include people, roles, addresses, times, or categories.
+Do NOT add or normalize text. Use contiguous substrings from the input.
+Return STRICT JSON only matching the provided schema.
+""".strip()
+
+
+def _openai_responses_create_with_retry(client: "OpenAI", **kwargs):
+    attempts = max(1, _env_int("OPENAI_REQUEST_ATTEMPTS", 4))
+    base_sleep = max(0.0, _env_float("OPENAI_RETRY_BACKOFF_SECONDS", 5.0))
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return client.responses.create(**kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                raise
+            sleep_s = min(60.0, base_sleep * (2 ** (attempt - 1)))
+            print(
+                f"[openai] request attempt {attempt}/{attempts} failed: {exc.__class__.__name__}; retry in {sleep_s:.1f}s",
+                flush=True,
+            )
+            time.sleep(sleep_s)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("OpenAI request failed without exception")
+
+
 def _call_model(model: genai.GenerativeModel, prompt: str, temperature: float) -> Dict:
     resp = model.generate_content(
         prompt,
@@ -207,6 +269,57 @@ def _call_model(model: genai.GenerativeModel, prompt: str, temperature: float) -
         },
     )
     return _extract_json(getattr(resp, "text", "") or "")
+
+
+def _call_openai_json(client: "OpenAI", model_name: str, developer_prompt: str, user_text: str, schema: Dict) -> Dict:
+    resp = _openai_responses_create_with_retry(
+        client,
+        model=model_name,
+        input=[
+            {"role": "developer", "content": developer_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": schema["name"],
+                "schema": schema["schema"],
+                "strict": True,
+            }
+        },
+    )
+    raw = _extract_openai_output_text(resp).strip()
+    raw = re.sub(r"^```json\s*", "", raw, flags=re.I)
+    raw = re.sub(r"^```\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    return json.loads(raw) if raw else {}
+
+
+def _extract_org_names(
+    text: str,
+    provider: str,
+    temperature: float,
+    gemini_model: Optional[genai.GenerativeModel] = None,
+    openai_client: Optional["OpenAI"] = None,
+    openai_model_name: str = "",
+) -> List[str]:
+    provider = (provider or "gemini").strip().lower()
+    if provider == "openai":
+        if not openai_client or not openai_model_name:
+            raise SystemExit("OpenAI name extraction requires OPENAI_API_KEY and --name_extraction_model")
+        data = _call_openai_json(
+            openai_client,
+            openai_model_name,
+            _build_openai_name_extraction_prompt(),
+            text,
+            OPENAI_ORG_NAMES_SCHEMA,
+        ) or {"org_names": []}
+    else:
+        if gemini_model is None:
+            raise SystemExit("Gemini name extraction requires GOOGLE_API_KEY and --model")
+        data = _call_model(gemini_model, _build_prompt(text), temperature) or {"org_names": []}
+    names = data.get("org_names") or []
+    return [str(x).strip() for x in names if str(x).strip()]
 
 
 def _load_text(path: str) -> str:
@@ -546,7 +659,8 @@ def _openai_payload_for_row(rows: List[Dict[str, str]], i: int) -> Dict:
 
 def _classify_row_openai(client: OpenAI, model_name: str, rows: List[Dict[str, str]], i: int) -> Dict:
     payload = _openai_payload_for_row(rows, i)
-    resp = client.responses.create(
+    resp = _openai_responses_create_with_retry(
+        client,
         model=model_name,
         input=[
             {"role": "developer", "content": OPENAI_DEV_PROMPT},
@@ -589,7 +703,8 @@ def _classify_page_openai(
         + "\n\nClassify ALL rows in one response. Return one output item per input row."
         + "\nPreserve line_no and align outputs strictly to provided rows."
     )
-    resp = client.responses.create(
+    resp = _openai_responses_create_with_retry(
+        client,
         model=model_name,
         input=[
             {"role": "developer", "content": page_prompt},
@@ -926,11 +1041,11 @@ def main() -> None:
     ap.add_argument("--input_dir", default="out_reflow", help="Input directory")
     ap.add_argument("--input_ext", default=".reflow.txt", help="Input file suffix, e.g. .reflow.txt or .org_lines.txt")
     ap.add_argument("--output", default="", help="Output file path (.json or .txt)")
-    ap.add_argument("--output_dir", default="out_org_names", help="Batch output directory")
+    ap.add_argument("--output_dir", default="output/org_names", help="Batch output directory")
     ap.add_argument("--emit_lines", action="store_true", help="Emit per-line social_organization csv/json")
     ap.add_argument("--lines_output", default="", help="Single-file per-line output path (.csv or .json)")
-    ap.add_argument("--lines_output_dir", default="out_org_lines_rows", help="Batch per-line output directory")
-    ap.add_argument("--lines_output_dir_cat", default="out_org_lines_cat", help="Per-line output dir with categories")
+    ap.add_argument("--lines_output_dir", default="output/org_lines_rows", help="Batch per-line output directory")
+    ap.add_argument("--lines_output_dir_cat", default="output/org_lines_cat", help="Per-line output dir with categories")
     ap.add_argument("--lines_suffix", default=".cat.csv", help="Per-line category output suffix")
     ap.add_argument("--reason_suffix", default=".reasons.csv", help="Per-line reasons output suffix")
     ap.add_argument("--category_mode", default="rule", help="rule=rules only; llm=Gemini fallback; llm_vision=Gemini+image; openai=Responses API page-batch classification")
@@ -938,9 +1053,11 @@ def main() -> None:
     ap.add_argument("--max_files", type=int, default=0, help="Max files to process (0=all)")
     ap.add_argument("--skip_existing", action="store_true", help="Skip files that already have output CSV in lines_output_dir_cat")
     ap.add_argument("--progress", action="store_true", help="Show progress")
+    ap.add_argument("--name_extraction_provider", default="auto", help="gemini, openai, or auto (auto=openai when category_mode=openai)")
+    ap.add_argument("--name_extraction_model", default="gpt-4.1-nano", help="OpenAI model for org-name extraction when provider=openai")
     ap.add_argument("--model", default="gemini-2.0-flash", help="Gemini model name")
     ap.add_argument("--api_key", default="", help="API key (or env GOOGLE_API_KEY)")
-    ap.add_argument("--openai_model", default="gpt-4.1-mini", help="OpenAI primary model for category_mode=openai")
+    ap.add_argument("--openai_model", default="gpt-4.1-nano", help="OpenAI primary model for category_mode=openai")
     ap.add_argument("--openai_refine_model", default="gpt-5.4", help="OpenAI second-pass model for low-confidence rows")
     ap.add_argument("--openai_refine_below", type=float, default=0.8, help="Second-pass threshold (confidence < this value)")
     ap.add_argument("--openai_max_evidence", type=int, default=2, help="Max evidence items in reasons output")
@@ -958,23 +1075,34 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.2, help="Temperature")
     args = ap.parse_args()
 
+    name_extraction_provider = (args.name_extraction_provider or "auto").strip().lower()
+    if name_extraction_provider not in ("auto", "gemini", "openai"):
+        raise SystemExit("--name_extraction_provider must be one of: auto, gemini, openai")
+    if name_extraction_provider == "auto":
+        name_extraction_provider = "openai" if args.category_mode == "openai" else "gemini"
+
     api_key = args.api_key or os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise SystemExit("Missing API key: set --api_key or GOOGLE_API_KEY")
-    if args.category_mode in ("llm", "llm_vision") and not api_key:
+    need_gemini = name_extraction_provider == "gemini" or args.category_mode in ("llm", "llm_vision") or args.llm_refine_with_gemini
+    if need_gemini and not api_key:
         raise SystemExit("Missing API key: set --api_key or GOOGLE_API_KEY")
     if args.category_mode == "llm_vision" and not args.image_root:
         raise SystemExit("llm_vision requires --image_root (path to folder containing e.g. Birmingham_scans_split)")
     openai_client = None
-    if args.category_mode == "openai" or args.llm_refine_with_openai:
+    if args.category_mode == "openai" or args.llm_refine_with_openai or name_extraction_provider == "openai":
         openai_key = args.openai_api_key or os.getenv("OPENAI_API_KEY")
         if not openai_key:
-            raise SystemExit("OpenAI refinement requires --openai_api_key or OPENAI_API_KEY")
+            raise SystemExit("OpenAI usage requires --openai_api_key or OPENAI_API_KEY")
         if OpenAI is None:
             raise SystemExit("openai package not installed. Please install dependencies from requirements.txt")
-        openai_client = OpenAI(api_key=openai_key)
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(args.model)
+        openai_client = OpenAI(
+            api_key=openai_key,
+            timeout=_env_float("OPENAI_TIMEOUT_SECONDS", 180.0),
+            max_retries=max(0, _env_int("OPENAI_MAX_RETRIES", 5)),
+        )
+    model = None
+    if need_gemini:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(args.model)
     gemini_refine_model = None
     if args.llm_refine_with_gemini:
         gm = (args.gemini_refine_model or "").strip()
@@ -995,8 +1123,14 @@ def main() -> None:
 
     if args.output and len(targets) == 1:
         text = _load_text(targets[0])
-        data = _call_model(model, _build_prompt(text), args.temperature) or {"org_names": []}
-        names = data.get("org_names") or []
+        names = _extract_org_names(
+            text=text,
+            provider=name_extraction_provider,
+            temperature=args.temperature,
+            gemini_model=model,
+            openai_client=openai_client,
+            openai_model_name=args.name_extraction_model,
+        )
         if args.output.endswith(".txt"):
             _write_txt(args.output, names)
         else:
@@ -1122,8 +1256,14 @@ def main() -> None:
             if os.path.isfile(out_csv):
                 continue
         text = _load_text(fp)
-        data = _call_model(model, _build_prompt(text), args.temperature) or {"org_names": []}
-        names = data.get("org_names") or []
+        names = _extract_org_names(
+            text=text,
+            provider=name_extraction_provider,
+            temperature=args.temperature,
+            gemini_model=model,
+            openai_client=openai_client,
+            openai_model_name=args.name_extraction_model,
+        )
         out_json = os.path.join(args.output_dir, rel + ".org_names.json")
         os.makedirs(os.path.dirname(out_json), exist_ok=True)
         with open(out_json, "w", encoding="utf-8") as f:

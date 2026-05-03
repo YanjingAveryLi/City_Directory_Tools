@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import json
+import os
+import subprocess
+import time
+from datetime import datetime
+from typing import List, Tuple
+from zoneinfo import ZoneInfo
+
+
+CHICAGO_TZ = ZoneInfo("America/Chicago")
+
+
+def iter_txt_files(root: str) -> List[str]:
+    files: List[str] = []
+    for r, _, fns in os.walk(root):
+        for fn in fns:
+            if fn.endswith(".txt"):
+                files.append(os.path.join(r, fn))
+    files.sort()
+    return files
+
+
+def rel_to_project(base_dir: str, file_path: str) -> str:
+    rel = os.path.relpath(os.path.abspath(file_path), os.path.abspath(base_dir))
+    return rel.replace("\\", "/")
+
+
+def infer_rel_from_roots(base_dir: str, file_path: str, roots: List[str]) -> str:
+    f_abs = os.path.abspath(file_path)
+    for root in roots:
+        if not root:
+            continue
+        r_abs = os.path.abspath(root)
+        try:
+            rel = os.path.relpath(f_abs, r_abs)
+        except Exception:
+            continue
+        if rel and not rel.startswith(".."):
+            root_name = os.path.basename(r_abs.rstrip(os.sep))
+            rel_norm = rel.replace("\\", "/")
+            return f"{root_name}/{rel_norm}" if root_name else rel_norm
+    return rel_to_project(base_dir, file_path)
+
+
+def strip_txt_suffix(path_rel: str) -> str:
+    s = path_rel.replace("\\", "/")
+    if s.endswith(".txt"):
+        return s[: -len(".txt")]
+    return s
+
+
+def expected_org_lines_txt(base_dir: str, raw_fp: str, roots: List[str]) -> str:
+    rel = infer_rel_from_roots(base_dir, raw_fp, roots)
+    return os.path.join(base_dir, "output/org_lines", rel + ".org_lines.txt")
+
+
+def expected_cat_csv(base_dir: str, raw_fp: str, roots: List[str]) -> str:
+    rel = strip_txt_suffix(infer_rel_from_roots(base_dir, raw_fp, roots))
+    return os.path.join(base_dir, "output/org_lines_cat", rel + ".cat.csv")
+
+
+def collect_targets(base_dir: str, roots: List[str], skip_prefix: str) -> List[Tuple[str, str]]:
+    targets: List[Tuple[str, str]] = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for fp in iter_txt_files(root):
+            rel = rel_to_project(base_dir, fp)
+            seg = rel.split("/")
+            city_year = seg[-2] if len(seg) >= 2 else "UNKNOWN"
+            if skip_prefix and city_year.startswith(skip_prefix):
+                continue
+            targets.append((city_year, fp))
+    targets.sort(key=lambda x: (x[0], x[1]))
+    return targets
+
+
+def run(cmd: List[str], cwd: str) -> int:
+    return subprocess.run(cmd, cwd=cwd).returncode
+
+
+def _append_progress_log(progress_log: str, payload: dict) -> None:
+    if not progress_log:
+        return
+    os.makedirs(os.path.dirname(progress_log), exist_ok=True)
+    rec = {"ts": datetime.now(CHICAGO_TZ).isoformat(timespec="seconds")}
+    rec.update(payload or {})
+    with open(progress_log, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _format_hms(seconds: float) -> str:
+    s = max(0, int(seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    return f"{h:02d}:{m:02d}:{sec:02d}"
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Run full pipeline from raw *_txt roots using OpenAI only.")
+    ap.add_argument("--base_dir", default=".", help="Project root")
+    ap.add_argument("--roots", default="", help="Comma-separated roots. Empty means auto-detect data/txt/*_txt.")
+    ap.add_argument("--max_new", type=int, default=120, help="Max files to process in this run")
+    ap.add_argument("--sleep_between", type=float, default=1.0, help="Seconds between files")
+    ap.add_argument("--skip_city_prefix", default="", help="Skip city-year prefix (e.g. Birmingham)")
+    ap.add_argument("--dry_run", action="store_true", help="Print plan only")
+    ap.add_argument("--org_model", default="gpt-4.1-nano", help="OpenAI model for stage1 org-line normalization")
+    ap.add_argument("--name_extraction_model", default="gpt-4.1-nano", help="OpenAI model for org-name extraction")
+    ap.add_argument("--category_model", default="gpt-4.1-nano", help="OpenAI model for category classification")
+    ap.add_argument("--category_refine_model", default="gpt-5.4", help="OpenAI model for second-pass refinement")
+    ap.add_argument("--progress_log", default="logs/pipeline_progress.jsonl", help="JSONL progress log path")
+    args = ap.parse_args()
+
+    base_dir = os.path.abspath(args.base_dir)
+    if args.roots.strip():
+        roots = [os.path.abspath(r.strip()) for r in args.roots.split(",") if r.strip()]
+    else:
+        roots = []
+        txt_data_root = os.path.join(base_dir, "data/txt")
+        if os.path.isdir(txt_data_root):
+            for name in sorted(os.listdir(txt_data_root)):
+                p = os.path.join(txt_data_root, name)
+                if os.path.isdir(p) and name.endswith("_txt"):
+                    roots.append(p)
+        if not roots:
+            for name in sorted(os.listdir(base_dir)):
+                p = os.path.join(base_dir, name)
+                if os.path.isdir(p) and name.endswith("_txt"):
+                    roots.append(p)
+
+    if not roots:
+        raise SystemExit("No roots found. Use --roots or ensure *_txt folders exist under base_dir.")
+
+    targets = collect_targets(base_dir, roots, args.skip_city_prefix)
+    if not targets:
+        print("No raw txt files found for current filters.")
+        return
+
+    planned: List[Tuple[str, str, bool, bool]] = []
+    for city_year, raw_fp in targets:
+        need_stage1 = not os.path.isfile(expected_org_lines_txt(base_dir, raw_fp, roots))
+        need_stage2 = not os.path.isfile(expected_cat_csv(base_dir, raw_fp, roots))
+        if need_stage1 or need_stage2:
+            planned.append((city_year, raw_fp, need_stage1, need_stage2))
+
+    planned = planned[: args.max_new]
+    print(f"targets={len(planned)} (max_new={args.max_new})")
+    print(f"roots={len(roots)}")
+    for i, (city_year, raw_fp, need1, need2) in enumerate(planned[:10], start=1):
+        print(f"[{i}] {city_year} :: {raw_fp} | stage1={need1} stage2={need2}")
+    if len(planned) > 10:
+        print(f"... ({len(planned) - 10} more)")
+
+    if args.dry_run:
+        return
+
+    roots_csv = ",".join(roots)
+    ok = 0
+    fail = 0
+    processed = 0
+    total_planned = len(planned)
+    run_t0 = time.time()
+    progress_log = os.path.join(base_dir, args.progress_log) if args.progress_log else ""
+    _append_progress_log(
+        progress_log,
+        {
+            "event": "run_start",
+            "total_planned": total_planned,
+            "base_dir": base_dir,
+            "roots": roots,
+            "org_model": args.org_model,
+            "name_extraction_model": args.name_extraction_model,
+            "category_model": args.category_model,
+            "openai_refine_model": args.category_refine_model,
+            "pipeline_family": "openai",
+        },
+    )
+
+    for idx, (city_year, raw_fp, need1, need2) in enumerate(planned, start=1):
+        file_t0 = time.time()
+        print(f"\n[{idx}/{len(planned)}] {city_year}")
+        print(f"raw: {raw_fp}")
+        org_fp = expected_org_lines_txt(base_dir, raw_fp, roots)
+        stage1_sec = 0.0
+        stage2_sec = 0.0
+
+        if need1:
+            s1_t0 = time.time()
+            cmd1 = [
+                "python",
+                "scripts/org_lines_openai.py",
+                "--input",
+                raw_fp,
+                "--input_roots",
+                roots_csv,
+                "--output_dir",
+                "output/org_lines",
+                "--model",
+                args.org_model,
+                "--skip_existing",
+            ]
+            rc1 = run(cmd1, base_dir)
+            stage1_sec = time.time() - s1_t0
+            if rc1 != 0:
+                print(f"  !! stage1 failed rc={rc1}")
+                fail += 1
+                processed += 1
+                elapsed = time.time() - run_t0
+                speed = (processed / elapsed) if elapsed > 0 else 0.0
+                remain = max(0, total_planned - processed)
+                eta_sec = (remain / speed) if speed > 0 else -1.0
+                print(
+                    f"  progress ok={ok} fail={fail} processed={processed}/{total_planned} "
+                    f"avg={elapsed / max(1, processed):.2f}s/file eta={_format_hms(eta_sec) if eta_sec >= 0 else '--:--:--'}"
+                )
+                _append_progress_log(
+                    progress_log,
+                    {
+                        "event": "file_done",
+                        "idx": idx,
+                        "total_planned": total_planned,
+                        "city_year": city_year,
+                        "raw_fp": raw_fp,
+                        "need_stage1": need1,
+                        "need_stage2": need2,
+                        "stage1_sec": round(stage1_sec, 3),
+                        "stage2_sec": round(stage2_sec, 3),
+                        "file_sec": round(time.time() - file_t0, 3),
+                        "status": "fail_stage1",
+                        "ok": ok,
+                        "fail": fail,
+                        "processed": processed,
+                        "elapsed_sec": round(elapsed, 3),
+                        "avg_sec_per_file": round(elapsed / max(1, processed), 3),
+                        "eta_sec": round(eta_sec, 3) if eta_sec >= 0 else -1,
+                    },
+                )
+                time.sleep(args.sleep_between)
+                continue
+
+        if need2:
+            s2_t0 = time.time()
+            cmd2 = [
+                "python",
+                "scripts/extract_org_names_from_reflow.py",
+                "--input",
+                org_fp,
+                "--input_dir",
+                "output/org_lines",
+                "--emit_lines",
+                "--lines_output_dir_cat",
+                "output/org_lines_cat",
+                "--output_dir",
+                "output/org_names",
+                "--name_extraction_provider",
+                "openai",
+                "--name_extraction_model",
+                args.name_extraction_model,
+                "--category_mode",
+                "openai",
+                "--openai_model",
+                args.category_model,
+                "--openai_refine_model",
+                args.category_refine_model,
+                "--openai_page_chunk_size",
+                "160",
+                "--openai_sleep_seconds",
+                "0.8",
+                "--skip_existing",
+            ]
+            rc2 = run(cmd2, base_dir)
+            stage2_sec = time.time() - s2_t0
+            if rc2 != 0:
+                print(f"  !! stage2 failed rc={rc2}")
+                fail += 1
+                processed += 1
+                elapsed = time.time() - run_t0
+                speed = (processed / elapsed) if elapsed > 0 else 0.0
+                remain = max(0, total_planned - processed)
+                eta_sec = (remain / speed) if speed > 0 else -1.0
+                print(
+                    f"  progress ok={ok} fail={fail} processed={processed}/{total_planned} "
+                    f"avg={elapsed / max(1, processed):.2f}s/file eta={_format_hms(eta_sec) if eta_sec >= 0 else '--:--:--'}"
+                )
+                _append_progress_log(
+                    progress_log,
+                    {
+                        "event": "file_done",
+                        "idx": idx,
+                        "total_planned": total_planned,
+                        "city_year": city_year,
+                        "raw_fp": raw_fp,
+                        "need_stage1": need1,
+                        "need_stage2": need2,
+                        "stage1_sec": round(stage1_sec, 3),
+                        "stage2_sec": round(stage2_sec, 3),
+                        "file_sec": round(time.time() - file_t0, 3),
+                        "status": "fail_stage2",
+                        "ok": ok,
+                        "fail": fail,
+                        "processed": processed,
+                        "elapsed_sec": round(elapsed, 3),
+                        "avg_sec_per_file": round(elapsed / max(1, processed), 3),
+                        "eta_sec": round(eta_sec, 3) if eta_sec >= 0 else -1,
+                    },
+                )
+                time.sleep(args.sleep_between)
+                continue
+
+        ok += 1
+        processed += 1
+        elapsed = time.time() - run_t0
+        speed = (processed / elapsed) if elapsed > 0 else 0.0
+        remain = max(0, total_planned - processed)
+        eta_sec = (remain / speed) if speed > 0 else -1.0
+        file_sec = time.time() - file_t0
+        print(
+            f"  timing stage1={stage1_sec:.2f}s stage2={stage2_sec:.2f}s file={file_sec:.2f}s | "
+            f"ok={ok} fail={fail} processed={processed}/{total_planned} "
+            f"avg={elapsed / max(1, processed):.2f}s/file eta={_format_hms(eta_sec) if eta_sec >= 0 else '--:--:--'}"
+        )
+        _append_progress_log(
+            progress_log,
+            {
+                "event": "file_done",
+                "idx": idx,
+                "total_planned": total_planned,
+                "city_year": city_year,
+                "raw_fp": raw_fp,
+                "need_stage1": need1,
+                "need_stage2": need2,
+                "stage1_sec": round(stage1_sec, 3),
+                "stage2_sec": round(stage2_sec, 3),
+                "file_sec": round(file_sec, 3),
+                "status": "ok",
+                "ok": ok,
+                "fail": fail,
+                "processed": processed,
+                "elapsed_sec": round(elapsed, 3),
+                "avg_sec_per_file": round(elapsed / max(1, processed), 3),
+                "eta_sec": round(eta_sec, 3) if eta_sec >= 0 else -1,
+            },
+        )
+        time.sleep(args.sleep_between)
+
+    print(f"\ndone ok={ok} fail={fail}")
+    _append_progress_log(
+        progress_log,
+        {
+            "event": "run_end",
+            "ok": ok,
+            "fail": fail,
+            "processed": processed,
+            "total_planned": total_planned,
+            "elapsed_sec": round(time.time() - run_t0, 3),
+        },
+    )
+    if fail > 0:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
